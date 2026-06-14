@@ -234,6 +234,59 @@ def _regime_badge(r):
     return f"<span class='{css}'>{r}</span>"
 
 
+def _map_noise_process(local_slopes: list, dominant_noise: str):
+    # Map analysis outputs to human-readable noise labels and confidence
+    if not local_slopes:
+        label = dominant_noise or "Unknown"
+        return label, 0.25
+    # derive simple confidence from number of slope segments
+    nseg = len(local_slopes)
+    conf = min(0.95, 0.4 + 0.12 * nseg)
+    # Normalize name
+    mapping = {
+        "WPM": "White PM",
+        "WFM": "White FM",
+        "FFM": "Flicker FM",
+        "FPM": "Flicker PM",
+        "RWFM": "Random Walk FM",
+        "DRIFT": "Frequency Drift",
+    }
+    label = mapping.get(dominant_noise.upper(), dominant_noise)
+    return label, conf
+
+
+def compute_quantitative_risk(sigma1_val, drift_per_day_val, excursion_count, sensitivity_ranking):
+    # Build a simple physics-informed risk score [0-100]
+    s = 0.0
+    # Allan (σy(1s)) contribution — normalized with expected engineering bench of 1e-10
+    if sigma1_val is not None and sigma1_val > 0:
+        s += min(40.0, 40.0 * (sigma1_val / 1e-10))
+    # Drift contribution — normalized per 1e-12/day
+    s += min(30.0, 30.0 * (abs(drift_per_day_val) / 1e-12))
+    # Excursions — each excursion adds fixed risk proportional to dataset size
+    s += min(20.0, 4.0 * excursion_count)
+    # Sensitivity_Ranking — if dominant contributor exists, small additive
+    try:
+        if isinstance(sensitivity_ranking, (list, tuple)) and len(sensitivity_ranking) > 0:
+            top = sensitivity_ranking[0]
+            # assume top[1] is percent sensitivity if present
+            if isinstance(top, (list, tuple)) and len(top) > 1:
+                s += min(10.0, float(top[1]) * 0.1)
+    except Exception:
+        pass
+    score = max(0.0, min(100.0, s))
+    # Map to categories
+    if score < 25:
+        cat = "LOW"
+    elif score < 50:
+        cat = "MODERATE"
+    elif score < 75:
+        cat = "HIGH"
+    else:
+        cat = "CRITICAL"
+    return score, cat
+
+
 def _cspi_badge(c, cat):
     css = {"NOMINAL": "cspi-nominal", "MARGINAL": "cspi-marginal",
            "DEGRADED": "cspi-degraded", "CRITICAL": "cspi-critical"}.get(cat, "cspi-degraded")
@@ -583,6 +636,11 @@ validation_result = {}
 cspi = 0.0
 cspi_cat = "UNKNOWN"
 risk_level = "UNKNOWN"
+# Default risk and forecast placeholders
+risk_score = 0.0
+risk_cat = "UNKNOWN"
+forecast_confidence = 0.0
+forecast_horizon_hours = 0
 
 
 @st.cache_data(show_spinner=False)
@@ -621,20 +679,47 @@ kc[6].metric("CSPI", f"{cspi:.1f}/100 ({cspi_cat})")
 kc[7].metric("Risk Level", risk_level)
 st.markdown("---")
 
+
 # AI Predictive Intelligence Layer — status banner (standby until AI tab opened)
 ai_banner_cols = st.columns([1, 3, 1])
 with ai_banner_cols[1]:
+    # Lightweight AI summary (always visible) — heavy AI runs lazily
     ai_status_text = "ACTIVE" if st.session_state.get(_cache_key) else "STANDBY"
-    st.markdown(f"<div class='ai-banner'><strong>AI Predictive Intelligence Layer: {ai_status_text}</strong></div>", unsafe_allow_html=True)
-    if ai_status_text == "ACTIVE":
-        model_status_rows = []
-        model_status_rows.append(("Kalman Filter", "Analysis Completed" if kalman_result.get("available") else "Unavailable"))
-        fx = forecast_result.get("horizons", {})
-        model_status_rows.append(("XGBoost", "Analysis Completed" if forecast_result.get("xgb_result", {}).get("available") else "Unavailable"))
-        model_status_rows.append(("LSTM", "Analysis Completed" if forecast_result.get("lstm_available") else "Unavailable"))
-        model_status_rows.append(("Ensemble Forecast", "Analysis Completed" if fx else "Unavailable"))
-        ms_df = pd.DataFrame(model_status_rows, columns=["Model", "Status"] )
-        st.table(ms_df)
+    # Compute lightweight risk and health indicators from metrology outputs
+    anomaly_prob_est = min(100.0, round(100.0 * (excursion_count / max(1, len(active_df))) , 1))
+    sensitivity_summary = sensitivity_ranking if sensitivity_ranking else []
+    risk_score, risk_cat = compute_quantitative_risk(sigma1 or 0.0, drift_per_day or 0.0, excursion_count, sensitivity_summary)
+    forecast_confidence = 0.0
+    forecast_horizon_hours = 0
+    # If AI compute ran before, surface real metrics
+    if st.session_state.get(_cache_key):
+        # pick from health_result / risk_result if available
+        try:
+            forecast_confidence = float(forecast_result.get("confidence", 0.0)) if isinstance(forecast_result, dict) else 0.0
+        except Exception:
+            forecast_confidence = 0.0
+        try:
+            forecast_horizon_hours = int(forecast_result.get("horizon_hours", 0)) if isinstance(forecast_result, dict) else 0
+        except Exception:
+            forecast_horizon_hours = 0
+        try:
+            anomaly_prob_est = float(warning_result.get("anomaly_probability", anomaly_prob_est)) if isinstance(warning_result, dict) else anomaly_prob_est
+        except Exception:
+            pass
+        try:
+            risk_score = float(risk_result.get("risk_score", risk_score)) if isinstance(risk_result, dict) else risk_score
+            risk_cat = risk_result.get("risk_level", risk_cat) if isinstance(risk_result, dict) else risk_cat
+        except Exception:
+            pass
+    # Health index: prefer health_result if available
+    try:
+        cspi_val = float(health_result.get("cspi", 0.0)) if isinstance(health_result, dict) else 0.0
+        cspi_cat = health_result.get("category", "UNKNOWN") if isinstance(health_result, dict) else "UNKNOWN"
+    except Exception:
+        cspi_val = 0.0
+        cspi_cat = "UNKNOWN"
+
+    # AI banner removed per user request
 
 # Timing diagnostics (per major module)
 timing_rows = [
@@ -778,8 +863,24 @@ if section == "📏 Frequency Metrology Analysis":
                     "slope": "Local Slope", "noise_process": "Noise Process"})
                 st.dataframe(ls_df, use_container_width=True, hide_index=True)
 
+            # Noise process identification
+            noise_label, noise_conf = _map_noise_process(local_slopes, dominant_noise)
+            st.markdown(f"**Dominant Noise Process:** {noise_label}  ")
+            st.markdown(f"**Noise Confidence:** {noise_conf*100:.0f}%  ")
+            st.markdown(f"**Scientific Interpretation:** The dominant noise process is {noise_label}. Confidence derived from ADEV local slope segmentation.")
+
         st.markdown(f"**Scientific Interpretation:** σy(1s)={_fmt(sigma1)}, σy(100s)={_fmt(sigma100)}. Regime: {regime}. Dominant noise: {dominant_noise}.")
         st.markdown("**Engineering Implication:** σy minimum identifies optimal operational averaging time. Rising slope at long τ indicates drift/RWFM coupling.")
+        # Stability budget summary (if available)
+        if not budget_df.empty:
+            st.markdown("**Stability Budget Breakdown (contributions)**")
+            try:
+                bd = budget_df.copy()
+                if "Contribution (%)" in bd.columns:
+                    bd = bd.sort_values("Contribution (%)", ascending=False)
+                st.dataframe(bd, use_container_width=True, hide_index=True)
+            except Exception:
+                st.dataframe(budget_df, use_container_width=True, hide_index=True)
 
     # ─── TAB 3 ───────────────────────────────────────────────────────────────
     with tab_noise:
@@ -968,14 +1069,19 @@ if section == "📏 Frequency Metrology Analysis":
         else:
             # Fallback: use sensitivity ranking (Pearson) and ML attribution where available
             fallback = []
-            sr = sensitivity_ranking.get("ranked_parameters", [])
+            sr = sensitivity_ranking.get("ranked_parameters", []) if isinstance(sensitivity_ranking, dict) else []
             if sr:
                 for r in sr[:5]:
-                    fallback.append({"Parameter": r["Parameter"], "Contribution (%)": round(r.get("|Pearson ρ|", 0) * 100.0, 2)})
-            elif ml_attr_result.get("available"):
-                ranked_ml = ml_attr_result.get("ranked", [])
-                for r in ranked_ml[:5]:
-                    fallback.append({"Parameter": r["Parameter"], "Contribution (%)": float(r.get("Importance Score", 0))})
+                    fallback.append({"Parameter": r.get("Parameter", "Unknown"), "Contribution (%)": round(r.get("|Pearson ρ|", 0) * 100.0, 2)})
+            else:
+                ml_avail = isinstance(ml_attr_result, dict) and (ml_attr_result.get("available") or ml_attr_result.get("feature_probs"))
+                if ml_avail:
+                    ranked_ml = ml_attr_result.get("ranked", []) if ml_attr_result.get("ranked") else ml_attr_result.get("feature_probs", [])
+                    for r in ranked_ml[:5]:
+                        if isinstance(r, (list, tuple)) and len(r) >= 2:
+                            fallback.append({"Parameter": r[0], "Contribution (%)": float(r[1])})
+                        elif isinstance(r, dict):
+                            fallback.append({"Parameter": r.get("Parameter", "Unknown"), "Contribution (%)": float(r.get("Importance Score", 0))})
             if fallback:
                 fb_df = pd.DataFrame(fallback)
                 fig_fb = px.bar(fb_df, x="Contribution (%)", y="Parameter", orientation="h", text="Contribution (%)", color="Contribution (%)", color_continuous_scale="Purples")
